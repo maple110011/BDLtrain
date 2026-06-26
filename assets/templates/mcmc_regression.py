@@ -3,7 +3,7 @@
 
 """
 Pyro BNN MCMC (NUTS) —— 生产级模板 (v2)
-新增: 后验持久化 / 配置哈希追溯 / ArviZ NetCDF 导出 / 运行环境记录
+新增: 后验持久化 / 配置哈希追溯 / ArviZ NetCDF / 运行环境 / 评估报告 / seed记录
 """
 import os, sys, json, time, hashlib, logging, platform
 from datetime import datetime
@@ -13,9 +13,16 @@ import pyro.distributions as dist
 from pyro.infer import MCMC, NUTS, Predictive
 import numpy as np
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+# 日志 (训练 + 错误分离)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_ch = logging.StreamHandler(); _ch.setLevel(logging.INFO); _ch.setFormatter(_fmt)
+logger.addHandler(_ch)
+_fh1 = logging.FileHandler("training.log", encoding="utf-8")
+_fh1.setLevel(logging.DEBUG); _fh1.setFormatter(_fmt); logger.addHandler(_fh1)
+_fh2 = logging.FileHandler("errors.log", encoding="utf-8")
+_fh2.setLevel(logging.ERROR); _fh2.setFormatter(_fmt); logger.addHandler(_fh2)
 
 # ═══════════════════════════════════════════════════════════
 # 配置
@@ -69,10 +76,16 @@ json.dump(env, open(os.path.join(MCMC_CONFIG["output_dir"], "environment.json"),
 # 保存配置
 with open(os.path.join(MCMC_CONFIG["output_dir"], "config.json"), "w") as f:
     json.dump({**MCMC_CONFIG, "hash": config_hash}, f, indent=2)
+# 显式记录种子
+json.dump({"seed": MCMC_CONFIG["seed"]}, 
+          open(os.path.join(MCMC_CONFIG["output_dir"], "seed.json"), "w"), indent=2)
+# 输出目录
+os.makedirs(os.path.join(MCMC_CONFIG["output_dir"], "figures"), exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════
 # MCMC 运行 (数据准备见模板1)
 # ═══════════════════════════════════════════════════════════
+nuts_kernel = NUTS(
     bnn_model,
     adapt_step_size=True,
     max_tree_depth=MCMC_CONFIG["max_tree_depth"],
@@ -127,12 +140,20 @@ try:
 
     ess = az.ess(idata, method="bulk")
     logger.info(f"ESS 范围: [{ess.min().values:.0f}, {ess.max().values:.0f}]")
-
     diverging = idata.sample_stats.get("diverging")
+    r_hat_max, ess_min, div_rate = None, None, None
     if diverging is not None:
         n_div = diverging.sum().values
-        logger.info(f"发散: {n_div}/{diverging.size} ({100*n_div/diverging.size:.1f}%)")
-
+        div_rate = n_div / diverging.size
+        logger.info(f"发散: {n_div}/{diverging.size} ({100*div_rate:.1f}%)")
+    if 'rhat' in dir():
+        r_hat_max = float(az.rhat(idata).max().values)
+    if 'ess' in dir():
+        ess_min = float(az.ess(idata, method="bulk").min().values)
+    # 保存结构化诊断
+    json.dump({"r_hat_max": r_hat_max, "ess_min": ess_min,
+               "divergence_rate": div_rate},
+              open(os.path.join(MCMC_CONFIG["output_dir"], "diagnostics.json"), "w"), indent=2)
 except ImportError:
     logger.info("ArviZ 未安装, 跳过 NetCDF 导出和详细诊断")
 
@@ -143,4 +164,27 @@ predictive = Predictive(bnn_model, mcmc.get_samples())
 preds = predictive(X_test_n)
 pred_mean = preds["obs"].mean(dim=0)
 pred_std = preds["obs"].std(dim=0)
-logger.info(f"MCMC 预测完成")
+rmse = ((pred_mean - y_test_n)**2).mean().sqrt()
+coverage = ((y_test_n >= pred_mean - 1.96 * pred_std) &
+            (y_test_n <= pred_mean + 1.96 * pred_std)).float().mean()
+logger.info(f"MCMC 预测完成 | RMSE: {rmse:.4f} | 95% PI 覆盖率: {coverage:.4f}")
+
+# ═══════════════════════════════════════════════════════════
+# 评估报告
+# ═══════════════════════════════════════════════════════════
+eval_report = {
+    "experiment": MCMC_CONFIG["experiment"],
+    "timestamp": datetime.now().isoformat(),
+    "environment": env, "config": MCMC_CONFIG,
+    "metrics": {"test_rmse": float(rmse), "coverage_95pct": float(coverage)},
+    "mcmc": {"num_samples": MCMC_CONFIG["num_samples"],
+             "warmup_steps": MCMC_CONFIG["warmup_steps"],
+             "num_chains": MCMC_CONFIG["num_chains"],
+             "elapsed_seconds": elapsed,
+             "r_hat_max": r_hat_max, "ess_min": ess_min,
+             "divergence_rate": div_rate},
+}
+json.dump(eval_report,
+          open(os.path.join(MCMC_CONFIG["output_dir"], "evaluation_report.json"), "w"),
+          indent=2, default=str)
+logger.info(f"评估报告已保存")

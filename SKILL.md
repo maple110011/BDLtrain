@@ -131,15 +131,20 @@ ELBO/Trace + 预测vs真实 + 残差 + 校准曲线.
 
 ## 代码输出要求
 
-Agent 生成的代码必须:
+Agent 生成的代码必须在训练完成后产生以下**全部**输出物（详见 [training-infra.md](./references/training-infra.md) §17）:
+
 1. **完整可运行** — import + 数据 + 训练 + 评估
-2. **记录运行环境** — ⚠️ 训练开始时捕获 CPU/GPU/RAM/框架版本等硬件信息, 打印到日志并保存为 `environment.json`。不同设备上的耗时数据才有可比性 ([training-infra.md](./references/training-infra.md) §13.3)
-3. **Checkpoint** — 定期保存/断点续训/最佳模型 (§10)
-4. **Early Stopping + LR调度** (§11-§12)
-5. **日志** — logging + CSV + 元数据 (§13)
-6. **NaN/Inf 检测与恢复** (§15)
-7. **诊断代码** — 训练后自动运行
-8. **可复现** — 固定种子, 保存 RNG state, 记录 config
+2. **运行环境记录** — `environment.json` + `seed.json` (§13.3)
+3. **Checkpoint 系统** — 中间 checkpoint + 最佳 checkpoint (`ckpt_best.tar`) + RNG state (§10)
+4. **模型权重导出** — `best_model.pt` (最佳) + `final_model.pt` (最终) — 便于部署和分享
+5. **训练日志** — `training.log` (完整) + `errors.log` (仅错误, 单独文件) (§13.1)
+6. **逐 epoch 指标** — `metrics.csv` (epoch, train_elbo, val_rmse, lr) (§13.2)
+7. **Early Stopping + LR调度** (§11-§12)
+8. **NaN/Inf 检测与恢复** (§15)
+9. **评估报告** — `evaluation_report.json` (结构化 JSON, 含所有指标+训练信息, 可脚本化批量对比) (§17.3)
+10. **诊断** — SVI: ELBO 收敛判断; MCMC: `diagnostics.json` + `posterior.pt` + `posterior.nc` (ArviZ)
+11. **图表** — ELBO曲线 / 预测vs真实 / 残差 / 校准曲线 → 保存到 `figures/`
+12. **可复现** — 固定种子, 保存 RNG state, 记录完整 config
 
 ## 参考资源
 
@@ -148,7 +153,7 @@ Agent 生成的代码必须:
 | [bdl-frameworks.md](./references/bdl-frameworks.md) | 框架对比与选型 |
 | [bdl-methods.md](./references/bdl-methods.md) | 推理方法详解 |
 | [core-training.md](./references/core-training.md) | 数据预处理(§1) / 先验(§2) / 架构(§3) / 稳定性(§4) / 诊断(§5) / 校准(§6) / 效率(§7) / 超参(§8) / 代码组织(§9) |
-| [training-infra.md](./references/training-infra.md) | Checkpoint(§10) / EarlyStopping(§11) / LR调度(§12) / **运行环境记录(§13.3)** / 日志(§13) / DataLoader(§14) / NaN检测(§15) / 效率进阶(§16) |
+| [training-infra.md](./references/training-infra.md) | Checkpoint(§10) / EarlyStopping(§11) / LR调度(§12) / 运行环境+种子(§13.3) / 日志+错误日志(§13.1-13.2) / DataLoader(§14) / NaN检测(§15) / 效率(§16) / **输出物清单(§17)** |
 | [diagnostics.md](./references/diagnostics.md) | 诊断/PPC/校准/排查表 |
 | [model-architecture.md](./references/model-architecture.md) | BNN 架构模式 |
 | [code-templates.md](./references/code-templates.md) | 模板索引 → [assets/templates/](./assets/templates/) |

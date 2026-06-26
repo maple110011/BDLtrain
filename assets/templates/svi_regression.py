@@ -5,7 +5,7 @@
 Pyro BNN 回归 —— 生产级模板 (v2)
 新增: Checkpoint断点续训 / Early Stopping / LR调度 / CSV日志 / NaN检测 / 运行环境记录
 """
-import os, sys, json, time, logging, warnings, platform, subprocess
+import os, sys, json, time, logging, warnings, platform, subprocess, csv
 from datetime import datetime
 import numpy as np
 import torch
@@ -19,15 +19,22 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 
 # ═══════════════════════════════════════════════════════════
-# 0. 日志系统
+# 0. 日志系统 (训练日志 + 错误日志分离)
 # ═══════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("training.log", encoding="utf-8"),
-              logging.StreamHandler()]
-)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+# 控制台
+_ch = logging.StreamHandler(); _ch.setLevel(logging.INFO); _ch.setFormatter(_fmt)
+logger.addHandler(_ch)
+# 训练日志 (完整)
+_fh1 = logging.FileHandler("training.log", encoding="utf-8")
+_fh1.setLevel(logging.DEBUG); _fh1.setFormatter(_fmt)
+logger.addHandler(_fh1)
+# 错误日志 (单独)
+_fh2 = logging.FileHandler("errors.log", encoding="utf-8")
+_fh2.setLevel(logging.ERROR); _fh2.setFormatter(_fmt)
+logger.addHandler(_fh2)
 
 # ═══════════════════════════════════════════════════════════
 # 1. 配置与种子
@@ -114,6 +121,14 @@ logger.info(f"PyTorch {env['packages']['torch']}, Pyro {env['packages']['pyro']}
 logger.info("=" * 60)
 json.dump(env, open("environment.json", "w", encoding="utf-8"),
           indent=2, ensure_ascii=False, default=str)
+# 显式记录种子
+json.dump({"seed": CONFIG["seed"]}, open("seed.json", "w"), indent=2)
+# CSV 日志
+csv_logger = csv.DictWriter(open("metrics.csv", "w", newline=""), 
+                             fieldnames=["epoch","train_elbo","val_rmse","lr"])
+csv_logger.writeheader()
+# 输出目录
+os.makedirs("figures", exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════
 # 2. 数据预处理 (假设 X_train, y_train, X_test, y_test 已有)
@@ -289,12 +304,14 @@ for epoch in range(start_epoch, CONFIG["num_epochs"]):
     if (epoch + 1) % 200 == 0:
         logger.info(f"{epoch+1:<8} {loss:<12.1f} {lr:<10.5f} 训练中")
 
-    # ── 评估 + Early Stopping ──
+    # ── 评估 + CSV + Early Stopping ──
     if (epoch + 1) % CONFIG["eval_interval"] == 0:
         with torch.no_grad():
             pred = Predictive(bnn_model, guide=guide, num_samples=50)(
                 X_test_n)
             val_rmse = ((pred["obs"].mean(0) - y_test_n)**2).mean().sqrt()
+        csv_logger.writerow({"epoch": epoch+1, "train_elbo": loss,
+                             "val_rmse": val_rmse.item(), "lr": lr})
         logger.info(f"  >> Epoch {epoch+1}: val_rmse={val_rmse:.4f}")
 
         if stopper(val_rmse.item()):
@@ -315,34 +332,45 @@ for epoch in range(start_epoch, CONFIG["num_epochs"]):
         logger.warning(f"⚠️ 达到最大训练时间 {CONFIG['max_training_hours']}h")
         break
 
-# 最终保存
+# 训练结束, 最终保存
 final_epoch = len(elbo_history) - 1
 ckpt_mgr.save(final_epoch, elbo_history, guide, optimizer, is_best=True)
-logger.info(f"训练完成, 共 {final_epoch+1} epochs, 耗时 "
-            f"{(time.time()-training_start)/60:.1f} min")
+total_time = time.time() - training_start
+logger.info(f"训练完成, 共 {final_epoch+1} epochs, 耗时 {total_time/60:.1f} min")
 
 # ═══════════════════════════════════════════════════════════
-# 7. 收敛检查
+# 7. 导出最佳模型权重 (轻量 .pt 文件)
+# ═══════════════════════════════════════════════════════════
+best_ckpt = torch.load(
+    os.path.join(CONFIG["checkpoint_dir"], "ckpt_best.tar"),
+    map_location="cpu", weights_only=False)
+pyro.get_param_store().load_state(best_ckpt["guide_state"])
+# 仅保存 guide 参数 (不含 optimizer/RNG, 用于推理部署)
+torch.save({"guide_state": best_ckpt["guide_state"],
+            "config": CONFIG,
+            "best_epoch": best_ckpt["best_epoch"],
+            "best_val_metric": best_ckpt["best_val_metric"]},
+           "best_model.pt")
+logger.info(f"最佳模型已导出至 best_model.pt (epoch {best_ckpt['best_epoch']})")
+# 同时保存训练结束时的最终模型
+torch.save({"guide_state": pyro.get_param_store().get_state(), "config": CONFIG},
+           "final_model.pt")
+
+# ═══════════════════════════════════════════════════════════
+# 8. 收敛检查
 # ═══════════════════════════════════════════════════════════
 elbo_arr = np.array(elbo_history)
 ma = np.convolve(elbo_arr, np.ones(200)/200, mode='valid')
 cv = np.std(ma[-200:]) / max(abs(np.mean(ma[-200:])), 1e-8)
-if cv < 0.001:
+elbo_converged = cv < 0.001
+if elbo_converged:
     logger.info(f"✅ ELBO 已收敛 (CV={cv:.6f})")
 else:
     logger.warning(f"⚠️ ELBO 可能未完全收敛 (CV={cv:.6f})")
 
 # ═══════════════════════════════════════════════════════════
-# 8. 预测与评估 (加载最佳 checkpoint)
+# 9. 预测与评估
 # ═══════════════════════════════════════════════════════════
-best_ckpt = torch.load(
-    os.path.join(CONFIG["checkpoint_dir"], "ckpt_best.tar"),
-    map_location="cpu", weights_only=False
-)
-pyro.get_param_store().load_state(best_ckpt["guide_state"])
-logger.info(f"已加载最佳模型 (epoch {best_ckpt['best_epoch']}, "
-            f"val_metric={best_ckpt['best_val_metric']:.4f})")
-
 predictive = Predictive(bnn_model, guide=guide,
                         num_samples=CONFIG["num_predictive_samples"])
 preds = predictive(X_test_n)
@@ -350,18 +378,39 @@ pred_mean_n = preds["obs"].mean(dim=0)
 pred_std_n = preds["obs"].std(dim=0)
 pred_mean = pred_mean_n * y_std + y_mean
 pred_std = pred_std_n * y_std
-
 rmse = ((pred_mean - y_test)**2).mean().sqrt()
-logger.info(f"测试 RMSE: {rmse:.4f}")
-
-z = 1.96
-lower = pred_mean - z * pred_std
-upper = pred_mean + z * pred_std
-coverage = ((y_test >= lower) & (y_test <= upper)).float().mean()
-logger.info(f"95% PI 覆盖率: {coverage:.4f} (理想 0.95)")
+coverage = ((y_test >= pred_mean - 1.96 * pred_std) &
+            (y_test <= pred_mean + 1.96 * pred_std)).float().mean()
+logger.info(f"测试 RMSE: {rmse:.4f} | 95% PI 覆盖率: {coverage:.4f}")
 
 # ═══════════════════════════════════════════════════════════
-# 9. 可视化
+# 10. 评估报告
+# ═══════════════════════════════════════════════════════════
+eval_report = {
+    "experiment": CONFIG["experiment"],
+    "timestamp": datetime.now().isoformat(),
+    "environment": env,
+    "config": CONFIG,
+    "metrics": {
+        "test_rmse": float(rmse),
+        "coverage_95pct": float(coverage),
+    },
+    "training": {
+        "total_epochs": final_epoch + 1,
+        "final_elbo": float(elbo_history[-1]),
+        "elbo_converged": elbo_converged,
+        "early_stopped": stopper.should_stop,
+        "training_time_seconds": total_time,
+        "best_epoch": ckpt_mgr.best_epoch,
+        "best_val_rmse": float(ckpt_mgr.best_val_metric),
+    },
+}
+json.dump(eval_report, open("evaluation_report.json", "w", encoding="utf-8"),
+          indent=2, ensure_ascii=False, default=str)
+logger.info("评估报告已保存至 evaluation_report.json")
+
+# ═══════════════════════════════════════════════════════════
+# 11. 可视化 (保存到 figures/)
 # ═══════════════════════════════════════════════════════════
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 axes[0].plot(elbo_history, alpha=0.5)
@@ -371,5 +420,5 @@ axes[1].plot([y_test_n.min(), y_test_n.max()], [y_test_n.min(), y_test_n.max()],
 axes[1].set_title("预测 vs 真实")
 axes[2].hist((y_test_n - pred_mean_n).cpu(), bins=30, alpha=0.7)
 axes[2].set_title("残差分布")
-plt.tight_layout(); plt.savefig("bnn_svi_results.png", dpi=150)
-logger.info("结果已保存至 bnn_svi_results.png")
+plt.tight_layout(); plt.savefig("figures/prediction_vs_true.png", dpi=150)
+logger.info("图表已保存至 figures/")

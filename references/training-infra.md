@@ -363,21 +363,33 @@ def warmup_lr(epoch, base_lr=0.01, warmup_epochs=500):
 ```python
 import logging
 
-# ⚠️ 配置分级日志: DEBUG(详细)/INFO(关键事件)/WARNING(潜在问题)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("training.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
+# ⚠️ 配置分级日志: 训练日志(INFO+) + 错误日志(ERROR+ 单独文件)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Handler 1: 控制台 — INFO 及以上
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(console)
+
+# Handler 2: 训练日志文件 — DEBUG 及以上 (完整记录)
+train_fh = logging.FileHandler("training.log", encoding="utf-8")
+train_fh.setLevel(logging.DEBUG)
+train_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(train_fh)
+
+# Handler 3: 错误日志 — ERROR 及以上, 单独文件
+error_fh = logging.FileHandler("errors.log", encoding="utf-8")
+error_fh.setLevel(logging.ERROR)
+error_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(error_fh)
 
 # 训练中使用:
 logger.info(f"开始训练 | config={config}")
 logger.info(f"Epoch {epoch}/{total} | ELBO={loss:.1f} | lr={lr:.5f}")
 logger.warning(f"检测到 ELBO 波动过大 (std={elbo_std:.1f})")
+logger.error(f"NaN detected at epoch {epoch}")  # 自动写入 errors.log
 ```
 
 ### 13.2 CSV 日志 (轻量级, 无需外部依赖)
@@ -494,9 +506,14 @@ logger.info("=" * 60)
 # 保存为 JSON, 方便后续汇总对比
 with open("environment.json", "w", encoding="utf-8") as f:
     json.dump(env, f, indent=2, ensure_ascii=False, default=str)
+
+# ⚠️ 同时保存种子信息 (单独文件, 便于审计)
+with open("seed.json", "w") as f:
+    json.dump({"seed": CONFIG["seed"], "rng_state_note":
+               "RNG state 已嵌入 checkpoint .tar 文件中"}, f, indent=2)
 ```
 
-> ⚠️ `capture_environment()` 依赖 `psutil`，需 `pip install psutil`。如果不想引入额外依赖，至少记录 `torch.cuda.get_device_name()` 和 `platform.processor()`。
+> ⚠️ `capture_environment()` 依赖 `psutil`，需 `pip install psutil`。如果不想引入额外依赖，至少记录 `torch.cuda.get_device_name()` 和 `platform.processor()`。还应增加 `psutil.disk_usage(".").free` 以记录可用磁盘空间。
 
 ### 13.4 实验元数据记录 (完整版)
 
@@ -759,3 +776,141 @@ if epoch % 1000 == 0:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 ```
+
+---
+
+## 17. 训练输出物清单 (⚠️ 必须全部生成)
+
+每次训练完成后，输出目录应包含以下文件。缺少任何一项意味着实验不可复现或无法跨设备比较。
+
+### 17.1 SVI 训练输出物
+
+```
+outputs/
+├── environment.json          # 运行环境 (CPU/GPU/RAM/磁盘/PyTorch版本)
+├── seed.json                 # 随机种子 (显式记录, 便于审计)
+├── experiment_metadata.json  # 完整元数据 (嵌入 environment + dataset + config)
+├── training.log              # 完整训练日志 (DEBUG 级别)
+├── errors.log                # 错误日志 (仅 ERROR 级别, 空文件=无错误)
+├── metrics.csv               # 逐 epoch 指标 (epoch, train_elbo, val_rmse, lr)
+├── checkpoints/
+│   ├── ckpt_epoch0500.tar    # 中间 checkpoint (含 RNG state + guide_state)
+│   ├── ckpt_epoch1000.tar
+│   ├── ...                   # 保留最近 N 个
+│   └── ckpt_best.tar         # 最佳模型 checkpoint
+├── best_model.pt             # 最佳模型权重 (仅 guide_state, 轻量)
+├── final_model.pt            # 最终模型权重 (训练结束时)
+├── evaluation_report.json    # 评估报告 (结构化)
+└── figures/
+    ├── elbo_curve.png        # ELBO 收敛曲线
+    ├── prediction_vs_true.png # 预测 vs 真实
+    ├── residuals.png         # 残差分布
+    └── calibration.png       # 校准曲线
+```
+
+### 17.2 MCMC 训练输出物
+
+```
+outputs/
+├── environment.json          # 同上
+├── seed.json                 # 同上
+├── experiment_metadata.json  # 同上
+├── posterior.pt              # 后验样本 (PyTorch 格式, 含 config hash)
+├── posterior.nc              # ArviZ InferenceData (NetCDF)
+├── diagnostics.json          # R-hat / ESS / 发散率 (结构化)
+├── evaluation_report.json    # 评估报告
+└── figures/
+    ├── trace_*.png           # Trace 图
+    ├── posterior_*.png       # 后验密度图
+    └── prediction_vs_true.png
+```
+
+### 17.3 评估报告格式
+
+```python
+# ⚠️ 评估完成后生成结构化报告, 方便脚本化对比多个实验
+def generate_evaluation_report(metrics, env, config, output_path):
+    """生成 JSON 格式的评估报告"""
+    report = {
+        "experiment": config.get("experiment", "unnamed"),
+        "timestamp": datetime.now().isoformat(),
+        "environment": env,
+        "config": config,
+        "metrics": {
+            "test_rmse": float(metrics["test_rmse"]),
+            "test_mae": float(metrics.get("test_mae", float("nan"))),
+            "coverage_95pct": float(metrics["coverage_95pct"]),
+            "coverage_90pct": float(metrics.get("coverage_90pct", float("nan"))),
+            "ece": float(metrics.get("ece", float("nan"))),
+        },
+        "training": {
+            "total_epochs": metrics.get("total_epochs", 0),
+            "final_elbo": float(metrics.get("final_elbo", float("nan"))),
+            "elbo_converged": metrics.get("elbo_converged", False),
+            "early_stopped": metrics.get("early_stopped", False),
+            "training_time_seconds": metrics.get("training_time_seconds", 0),
+            "best_epoch": metrics.get("best_epoch", 0),
+        },
+        "diagnostics": {
+            "mcmc_r_hat_max": metrics.get("r_hat_max"),
+            "mcmc_ess_min": metrics.get("ess_min"),
+            "mcmc_divergence_rate": metrics.get("divergence_rate"),
+        },
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+    logger.info(f"评估报告已保存至 {output_path}")
+
+
+# ─── SVI 训练结束后调用 ───
+generate_evaluation_report(
+    metrics={
+        "test_rmse": rmse.item(),
+        "coverage_95pct": coverage.item(),
+        "total_epochs": final_epoch + 1,
+        "final_elbo": elbo_history[-1],
+        "elbo_converged": cv < 0.001,
+        "early_stopped": stopper.should_stop,
+        "training_time_seconds": time.time() - training_start,
+        "best_epoch": ckpt_mgr.best_epoch,
+    },
+    env=env,
+    config=CONFIG,
+    output_path="evaluation_report.json"
+)
+
+# ─── MCMC 训练结束后调用 ───
+generate_evaluation_report(
+    metrics={
+        "test_rmse": rmse.item(),
+        "coverage_95pct": coverage.item(),
+        "training_time_seconds": elapsed,
+        "r_hat_max": float(rhat.max().values) if 'rhat' in dir() else None,
+        "ess_min": float(ess.min().values) if 'ess' in dir() else None,
+        "divergence_rate": n_div / diverging.size if 'n_div' in dir() else None,
+    },
+    env=env,
+    config=MCMC_CONFIG,
+    output_path="evaluation_report.json"
+)
+```
+
+### 17.4 输出物检查清单
+
+| 类别 | 文件 | SVI | MCMC |
+|------|------|:---:|:---:|
+| 环境 | `environment.json` | ✅ | ✅ |
+| 种子 | `seed.json` | ✅ | ✅ |
+| 元数据 | `experiment_metadata.json` | ✅ | ✅ |
+| 训练日志 | `training.log` | ✅ | ✅ |
+| 错误日志 | `errors.log` | ✅ | ✅ |
+| 指标 | `metrics.csv` | ✅ | — |
+| 中间检查点 | `checkpoints/ckpt_epoch*.tar` | ✅ | — |
+| 最佳模型 | `checkpoints/ckpt_best.tar` | ✅ | — |
+| 最佳权重 | `best_model.pt` | ✅ | — |
+| 最终权重 | `final_model.pt` | ✅ | — |
+| 后验样本 | `posterior.pt` | — | ✅ |
+| 后验(ArviZ) | `posterior.nc` | — | ✅ |
+| 诊断 | `diagnostics.json` | — | ✅ |
+| 评估报告 | `evaluation_report.json` | ✅ | ✅ |
+| 图表 | `figures/*.png` | ✅ | ✅ |
