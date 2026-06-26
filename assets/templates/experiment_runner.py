@@ -3,9 +3,9 @@
 
 """
 实验管理器 —— 管理多次 BDL 训练的完整生命周期
-功能: 超参数网格搜索 / 多次随机种子 / 结果汇总 / 模型选优
+功能: 超参数网格搜索 / 多次随机种子 / 结果汇总 / 模型选优 / 运行环境记录
 """
-import os, json, time, copy, itertools
+import os, json, time, copy, itertools, platform
 from datetime import datetime
 import numpy as np
 import torch
@@ -23,6 +23,16 @@ class ExperimentRunner:
         self.base_dir = base_dir
         self.results = []
         os.makedirs(base_dir, exist_ok=True)
+        # 记录全局运行环境 (所有实验共享)
+        self._env = {
+            "platform": platform.platform(),
+            "cpu_model": platform.processor() or "Unknown",
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
+            "torch": torch.__version__, "pyro": pyro.__version__,
+            "timestamp": datetime.now().isoformat(),
+        }
+        json.dump(self._env, open(os.path.join(base_dir, "environment.json"), "w"),
+                  indent=2, default=str)
     
     def run_grid_search(self, train_fn, param_grid, seeds=[42]):
         """
@@ -96,8 +106,9 @@ class ExperimentRunner:
                 print(f"  实验: {best['experiment']}, seed={best['seed']}")
                 print(f"  耗时: {best['elapsed_min']:.1f} min")
         
-        # 保存完整汇总
+        # 保存完整汇总 (含环境信息, 便于跨设备对比)
         summary = {
+            "environment": self._env,
             "total": len(self.results),
             "successful": len(successful),
             "failed": len(failed),

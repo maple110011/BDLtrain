@@ -4,8 +4,11 @@
 """
 MC Dropout——轻量级不确定性估计
 适用: 大模型、大数据、快速原型
+注意: 训练完成后建议记录运行环境 (CPU/GPU型号) 以便比较不同设备的耗时
 """
+import torch
 import torch.nn as nn
+import platform, json
 
 class MCDropoutNet(nn.Module):
     def __init__(self, input_dim, hidden_dims, output_dim, dropout_p=0.1):
@@ -46,3 +49,15 @@ def mc_predict(model, X, num_samples=100):
     model.train()  # 关键!
     preds = torch.stack([model(X).squeeze().detach() for _ in range(num_samples)])
     return preds.mean(dim=0), preds.std(dim=0)
+
+# ─── 辅助: 记录运行环境 ───
+def save_environment(save_path="environment.json"):
+    """训练结束后保存硬件信息, 方便跨设备对比"""
+    env = {
+        "platform": platform.platform(),
+        "cpu_model": platform.processor() or "Unknown",
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
+        "torch_version": torch.__version__,
+    }
+    json.dump(env, open(save_path, "w"), indent=2, default=str)
+    print(f"环境信息已保存至 {save_path}")

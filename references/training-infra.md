@@ -406,7 +406,101 @@ logger.log(epoch=100, train_elbo=-45.2, val_rmse=0.12, lr=0.01,
            timestamp=time.time())
 ```
 
-### 13.3 实验元数据记录
+### 13.3 运行环境记录 (⚠️ 不同设备间实验可比性的基础)
+
+> **为什么必须记录**: 笔记本 CPU、Colab GPU、专用计算卡之间性能差距可达 10-100 倍，不记录硬件信息则所有耗时数据毫无参照价值。每次训练都必须输出完整运行环境。
+
+```python
+import platform, psutil, subprocess
+
+def capture_environment():
+    """
+    采集当前运行环境的完整信息。
+    在训练脚本开头调用, 将结果同时打印到日志和保存为 JSON。
+    这样在不同设备上运行的结果才能互相参照。
+    """
+    env_info = {
+        # ── 操作系统 ──
+        "platform": platform.platform(),
+        "hostname": platform.node(),
+        "python_version": sys.version,
+        # ── CPU ──
+        "cpu": {
+            "model": platform.processor() or "Unknown",
+            "physical_cores": psutil.cpu_count(logical=False),
+            "logical_cores": psutil.cpu_count(logical=True),
+            "ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 1),
+            "ram_available_gb": round(psutil.virtual_memory().available / (1024**3), 1),
+        },
+        # ── GPU ──
+        "gpu": {
+            "available": torch.cuda.is_available(),
+            "count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        },
+        # ── 软件版本 ──
+        "packages": {
+            "torch": torch.__version__,
+            "pyro": pyro.__version__,
+            "numpy": np.__version__,
+        },
+        # ── PyTorch 编译信息 (决定CPU指令集优化) ──
+        "torch_config": {
+            "cuda_version": torch.version.cuda if torch.cuda.is_available() else "N/A",
+            "mkl_available": torch.backends.mkl.is_available() if hasattr(torch.backends, "mkl") else False,
+            "mkldnn_available": torch.backends.mkldnn.is_available(),
+        },
+    }
+
+    # 逐卡记录 GPU 详细信息
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            env_info["gpu"][f"device_{i}"] = {
+                "name": props.name,
+                "vram_total_gb": round(props.total_mem / (1024**3), 1),
+                "compute_capability": f"{props.major}.{props.minor}",
+                "multi_processor_count": props.multi_processor_count,
+            }
+
+    # 可选: 尝试检测是否在 Colab / Kaggle 环境
+    try:
+        import IPython
+        env_info["runtime"] = "Colab" if "google.colab" in sys.modules else "Local"
+    except ImportError:
+        env_info["runtime"] = "Local"
+
+    return env_info
+
+
+# ─── 在训练脚本中使用 ───
+env = capture_environment()
+logger.info("=" * 60)
+logger.info("运行环境:")
+logger.info(f"  CPU: {env['cpu']['model']} "
+            f"({env['cpu']['physical_cores']}C/{env['cpu']['logical_cores']}T, "
+            f"{env['cpu']['ram_total_gb']}GB RAM)")
+if env["gpu"]["available"]:
+    for i in range(env["gpu"]["count"]):
+        g = env["gpu"][f"device_{i}"]
+        logger.info(f"  GPU[{i}]: {g['name']} ({g['vram_total_gb']}GB, CC {g['compute_capability']})")
+else:
+    logger.info("  GPU: 无 (CPU only)")
+logger.info(f"  PyTorch {env['packages']['torch']}, "
+            f"Pyro {env['packages']['pyro']}, "
+            f"CUDA {env['torch_config']['cuda_version']}")
+logger.info(f"  运行时: {env['runtime']}")
+logger.info("=" * 60)
+
+# 保存为 JSON, 方便后续汇总对比
+with open("environment.json", "w", encoding="utf-8") as f:
+    json.dump(env, f, indent=2, ensure_ascii=False, default=str)
+```
+
+> ⚠️ `capture_environment()` 依赖 `psutil`，需 `pip install psutil`。如果不想引入额外依赖，至少记录 `torch.cuda.get_device_name()` 和 `platform.processor()`。
+
+### 13.4 实验元数据记录 (完整版)
+
+在以上环境信息基础上，生成训练脚本时还应一并记录：
 
 ```python
 # ⚠️ 每个实验必须记录完整的元数据, 便于后续复现和比较
@@ -415,18 +509,7 @@ EXPERIMENT_METADATA = {
     "description": "BNN 回归: 1隐层20单元, SVI Diagonal guide",
     "date": datetime.now().isoformat(),
     "git_commit": subprocess.getoutput("git rev-parse HEAD"),
-    "hostname": os.uname().nodename,
-    "python_version": sys.version,
-    "packages": {
-        "torch": torch.__version__,
-        "pyro": pyro.__version__,
-        "numpy": np.__version__,
-    },
-    "hardware": {
-        "cpu": os.cpu_count(),
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
-        "gpu_memory": torch.cuda.get_device_properties(0).total_mem if torch.cuda.is_available() else 0,
-    },
+    "environment": capture_environment(),  # ← 嵌入环境信息
     "dataset": {
         "n_train": len(X_train),
         "n_val": len(X_val),
@@ -440,7 +523,9 @@ with open("experiment_metadata.json", "w") as f:
     json.dump(EXPERIMENT_METADATA, f, indent=2, default=str)
 ```
 
-### 13.4 与 wandb / TensorBoard 集成 (可选)
+> ✅ **关键原则**: 实验报告或论文中描述训练耗时时，必须附带环境信息，否则数据无意义。建议在训练日志开头和 `experiment_metadata.json` 中均记录环境，方便事后查证。
+
+### 13.5 与 wandb / TensorBoard 集成 (可选)
 
 ```python
 # ⚠️ wandb 集成 — 推荐用于正式实验

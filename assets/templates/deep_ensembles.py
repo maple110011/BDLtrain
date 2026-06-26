@@ -3,7 +3,12 @@
 
 """
 Deep Ensembles —— 通过多模型集成获得不确定性
+注意: 训练完成后建议记录运行环境以便跨设备对比
 """
+import torch
+import torch.nn as nn
+import platform, json
+
 def train_ensemble(model_class, model_kwargs, X_train, y_train,
                    num_models=5, epochs=100, lr=0.01):
     """
@@ -34,3 +39,13 @@ def ensemble_predict(models, X):
     with torch.no_grad():
         preds = torch.stack([m(X).squeeze() for m in models])
     return preds.mean(dim=0), preds.std(dim=0)
+
+def save_environment(save_path="environment.json"):
+    """训练结束后保存硬件信息"""
+    env = {
+        "platform": platform.platform(),
+        "cpu_model": platform.processor() or "Unknown",
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None",
+        "torch_version": torch.__version__,
+    }
+    json.dump(env, open(save_path, "w"), indent=2, default=str)

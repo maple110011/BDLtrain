@@ -3,9 +3,9 @@
 
 """
 Pyro BNN MCMC (NUTS) —— 生产级模板 (v2)
-新增: 后验持久化 / 配置哈希追溯 / ArviZ NetCDF 导出
+新增: 后验持久化 / 配置哈希追溯 / ArviZ NetCDF 导出 / 运行环境记录
 """
-import os, json, time, hashlib, logging
+import os, sys, json, time, hashlib, logging, platform
 from datetime import datetime
 import torch
 import pyro
@@ -42,13 +42,37 @@ config_hash = hashlib.md5(
 ).hexdigest()[:8]
 logger.info(f"实验: {MCMC_CONFIG['experiment']} (hash={config_hash})")
 
+# ═══════════════════════════════════════════════════════════
+# 运行环境记录
+# ═══════════════════════════════════════════════════════════
+env = {
+    "platform": platform.platform(),
+    "hostname": platform.node(),
+    "cpu_model": platform.processor() or "Unknown",
+    "gpu": {"available": torch.cuda.is_available(),
+            "count": torch.cuda.device_count() if torch.cuda.is_available() else 0},
+    "packages": {"torch": torch.__version__, "pyro": pyro.__version__,
+                  "numpy": np.__version__},
+}
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        env["gpu"][f"device_{i}"] = {
+            "name": props.name,
+            "vram_gb": round(props.total_mem / (1024**3), 1),
+        }
+logger.info(f"环境: {env['cpu_model']} | "
+            + (f"GPU: {env['gpu']['device_0']['name']}" if env["gpu"]["available"] else "CPU only"))
+json.dump(env, open(os.path.join(MCMC_CONFIG["output_dir"], "environment.json"), "w"),
+          indent=2, default=str)
+
+# 保存配置
 with open(os.path.join(MCMC_CONFIG["output_dir"], "config.json"), "w") as f:
     json.dump({**MCMC_CONFIG, "hash": config_hash}, f, indent=2)
 
 # ═══════════════════════════════════════════════════════════
 # MCMC 运行 (数据准备见模板1)
 # ═══════════════════════════════════════════════════════════
-nuts_kernel = NUTS(
     bnn_model,
     adapt_step_size=True,
     max_tree_depth=MCMC_CONFIG["max_tree_depth"],

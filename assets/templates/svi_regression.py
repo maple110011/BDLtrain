@@ -3,9 +3,9 @@
 
 """
 Pyro BNN 回归 —— 生产级模板 (v2)
-新增: Checkpoint断点续训 / Early Stopping / LR调度 / CSV日志 / NaN检测
+新增: Checkpoint断点续训 / Early Stopping / LR调度 / CSV日志 / NaN检测 / 运行环境记录
 """
-import os, sys, json, time, logging, warnings
+import os, sys, json, time, logging, warnings, platform, subprocess
 from datetime import datetime
 import numpy as np
 import torch
@@ -57,6 +57,63 @@ pyro.set_rng_seed(CONFIG["seed"])
 torch.manual_seed(CONFIG["seed"])
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"设备: {device} | 实验: {CONFIG['experiment']}")
+
+# ═══════════════════════════════════════════════════════════
+# 1.5 运行环境记录 (⚠️ 不同设备间实验可比性的基础)
+# ═══════════════════════════════════════════════════════════
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+    logger.warning("psutil 未安装, CPU 详细信息将不可用。安装: pip install psutil")
+
+def capture_environment():
+    """采集当前运行环境的完整信息。不同设备上的耗时才有可比性。"""
+    env = {
+        "platform": platform.platform(),
+        "hostname": platform.node(),
+        "python_version": sys.version,
+        "cpu": {"model": platform.processor() or "Unknown"},
+        "gpu": {"available": torch.cuda.is_available(),
+                "count": torch.cuda.device_count() if torch.cuda.is_available() else 0},
+        "packages": {"torch": torch.__version__, "pyro": pyro.__version__,
+                      "numpy": np.__version__},
+        "torch_config": {
+            "cuda_version": torch.version.cuda if torch.cuda.is_available() else "N/A",
+            "mkldnn_available": torch.backends.mkldnn.is_available(),
+        },
+    }
+    if _HAS_PSUTIL:
+        env["cpu"]["physical_cores"] = psutil.cpu_count(logical=False)
+        env["cpu"]["logical_cores"] = psutil.cpu_count(logical=True)
+        env["cpu"]["ram_total_gb"] = round(psutil.virtual_memory().total / (1024**3), 1)
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            env["gpu"][f"device_{i}"] = {
+                "name": props.name,
+                "vram_total_gb": round(props.total_mem / (1024**3), 1),
+                "compute_capability": f"{props.major}.{props.minor}",
+            }
+    return env
+
+env = capture_environment()
+logger.info("=" * 60)
+logger.info(f"CPU: {env['cpu']['model']} "
+            f"({env['cpu'].get('physical_cores','?')}C/{env['cpu'].get('logical_cores','?')}T"
+            + (f", {env['cpu'].get('ram_total_gb','?')}GB RAM)" if _HAS_PSUTIL else ")"))
+if env["gpu"]["available"]:
+    for i in range(env["gpu"]["count"]):
+        g = env["gpu"][f"device_{i}"]
+        logger.info(f"GPU[{i}]: {g['name']} ({g['vram_total_gb']}GB, CC {g['compute_capability']})")
+else:
+    logger.info("GPU: 无 (CPU only)")
+logger.info(f"PyTorch {env['packages']['torch']}, Pyro {env['packages']['pyro']}, "
+            f"CUDA {env['torch_config']['cuda_version']}")
+logger.info("=" * 60)
+json.dump(env, open("environment.json", "w", encoding="utf-8"),
+          indent=2, ensure_ascii=False, default=str)
 
 # ═══════════════════════════════════════════════════════════
 # 2. 数据预处理 (假设 X_train, y_train, X_test, y_test 已有)
